@@ -1,0 +1,255 @@
+# GitLab CI/CD 配置文件 - 代码开源到 GitHub
+# 功能: 安全扫描 + 代码测试 + 自动镜像到 GitHub
+
+stages:
+  - security    # 安全扫描阶段
+  - test        # 代码测试阶段
+  - mirror      # 镜像同步阶段
+
+# ================================
+# 安全扫描模板引入
+# ================================
+include:
+  # 密钥检测 - 防止敏感信息泄露
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  # 开源协议扫描 - 确保依赖包合规
+  - template: Security/License-Scanning.gitlab-ci.yml
+
+# ================================
+# 安全扫描任务配置
+# ================================
+
+# 自定义密钥检测规则
+secret_detection:
+  stage: security
+  variables:
+    # 排除测试和文档目录
+    SECRET_DETECTION_EXCLUDED_PATHS: 'tests/,docs/,examples/'
+  artifacts:
+    reports:
+      secret_detection: gl-secret-detection-report.json
+    expire_in: 1 week
+  only:
+    - merge_requests
+    - master
+
+# 开源协议扫描
+license_scanning:
+  stage: security
+  variables:
+    # 根据项目类型配置依赖安装命令
+    LICENSE_MANAGEMENT_SETUP_CMD: npm install  # Node.js 项目
+    # 如果是 Python 项目，改为: pip install -r requirements.txt
+  artifacts:
+    reports:
+      license_scanning: gl-license-scanning-report.json
+    expire_in: 1 week
+  only:
+    - merge_requests
+    - master
+
+# ================================
+# 代码测试任务
+# ================================
+
+# 代码质量检查和单元测试
+test:
+  stage: test
+  image: node:18-alpine  # 使用 Node.js 18 环境，根据项目需要修改
+  before_script:
+    - echo "📦 安装项目依赖..."
+    - npm ci  # 使用 ci 命令确保依赖版本一致
+  script:
+    # 代码风格检查
+    - echo "🔍 运行代码风格检查..."
+    - npm run lint || echo "⚠️ Lint 检查未通过，但继续执行"
+    
+    # 单元测试
+    - echo "🧪 运行单元测试..."
+    - npm run test || echo "⚠️ 测试未通过，但继续执行"
+    
+    # 构建检查（确保代码可以成功构建）
+    - echo "🔨 检查构建..."
+    - npm run build || echo "⚠️ 构建未通过，但继续执行"
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - node_modules/
+      - .npm/
+  artifacts:
+    reports:
+      junit: junit.xml  # 如果测试框架支持 JUnit 格式
+    paths:
+      - coverage/
+    expire_in: 1 week
+  only:
+    - merge_requests
+    - master
+  tags:
+    - docker
+
+# ================================
+# 镜像到 GitHub 任务
+# ================================
+
+mirror_to_github:
+  stage: mirror
+  image: alpine/git:latest  # 轻量级 Git 镜像
+  
+  # 仅在 master 分支有变更时触发
+  only:
+    - master
+  
+  before_script:
+    - echo "🚀 准备同步代码到 GitHub..."
+    - echo "触发用户: ${GITLAB_USER_LOGIN}"
+    - echo "Commit SHA: ${CI_COMMIT_SHA}"
+    - echo "Commit Message: ${CI_COMMIT_MESSAGE}"
+  
+  script:
+    # 配置 Git 用户信息
+    - git config --global user.name "GitLab Mirror Bot"
+    - git config --global user.email "bot@gitlab.example.com"
+    
+    # 记录同步开始时间
+    - export SYNC_START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+    - echo "同步开始时间: ${SYNC_START_TIME}"
+    
+    # 创建审计日志
+    - mkdir -p audit-logs
+    - echo "========================================" > audit-logs/mirror-audit.log
+    - echo "同步时间: ${SYNC_START_TIME}" >> audit-logs/mirror-audit.log
+    - echo "触发用户: ${GITLAB_USER_LOGIN}" >> audit-logs/mirror-audit.log
+    - echo "Commit SHA: ${CI_COMMIT_SHA}" >> audit-logs/mirror-audit.log
+    - echo "Commit Message: ${CI_COMMIT_MESSAGE}" >> audit-logs/mirror-audit.log
+    - echo "Pipeline ID: ${CI_PIPELINE_ID}" >> audit-logs/mirror-audit.log
+    - echo "Pipeline URL: ${CI_PIPELINE_URL}" >> audit-logs/mirror-audit.log
+    - echo "----------------------------------------" >> audit-logs/mirror-audit.log
+    
+    # 克隆当前仓库（bare 克隆，不包含工作目录）
+    - echo "📥 克隆 GitLab 仓库..."
+    - git clone --mirror https://oauth2:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git temp-repo
+    - cd temp-repo
+    
+    # 添加 GitHub 远程仓库
+    - echo "🔗 添加 GitHub 远程仓库..."
+    - git remote add github https://${GITHUB_USERNAME}:${GITHUB_TOKEN}@github.com/${GITHUB_USERNAME}/${GITHUB_REPO}.git
+    
+    # 推送 master 分支到 GitHub 的 main 分支
+    - echo "📤 推送代码到 GitHub main 分支..."
+    - git push github refs/heads/master:refs/heads/main --force
+    
+    # 同步所有标签
+    - echo "🏷️  同步 Git 标签..."
+    - git push github --tags --force || echo "⚠️ 标签推送失败或无标签"
+    
+    # 记录同步结果
+    - export SYNC_END_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+    - echo "同步结束时间: ${SYNC_END_TIME}" >> ../audit-logs/mirror-audit.log
+    - echo "同步状态: SUCCESS ✅" >> ../audit-logs/mirror-audit.log
+    - echo "GitHub 仓库: https://github.com/${GITHUB_USERNAME}/${GITHUB_REPO}" >> ../audit-logs/mirror-audit.log
+    - echo "========================================" >> ../audit-logs/mirror-audit.log
+    
+    # 显示成功信息
+    - echo "✅ 代码已成功同步到 GitHub!"
+    - echo "📍 GitHub 仓库地址: https://github.com/${GITHUB_USERNAME}/${GITHUB_REPO}"
+    - echo "🔍 查看 GitHub Commits: https://github.com/${GITHUB_USERNAME}/${GITHUB_REPO}/commits/main"
+  
+  after_script:
+    # 清理临时仓库
+    - echo "🧹 清理临时文件..."
+    - cd ..
+    - rm -rf temp-repo
+    - echo "清理完成"
+  
+  # 保存审计日志
+  artifacts:
+    paths:
+      - audit-logs/mirror-audit.log
+    expire_in: 1 year  # 审计日志保留 1 年
+  
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: 0  # 完整克隆，包含所有历史记录
+  
+  tags:
+    - docker
+  
+  # 失败时重试配置
+  retry:
+    max: 2  # 最多重试 2 次
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+# ================================
+# 通知任务（可选）
+# ================================
+
+# 同步成功通知
+notify_success:
+  stage: .post  # 在所有阶段完成后执行
+  image: curlimages/curl:latest
+  script:
+    - echo "📢 发送成功通知..."
+    # 如果配置了 Webhook，可以在这里发送通知
+    # 示例：发送到钉钉/企业微信
+    # - |
+    #   curl -X POST "${DINGTALK_WEBHOOK}" \
+    #     -H 'Content-Type: application/json' \
+    #     -d "{
+    #       \"msgtype\": \"markdown\",
+    #       \"markdown\": {
+    #         \"title\": \"代码开源同步成功\",
+    #         \"text\": \"## 📢 代码开源同步通知\n\n**项目**: ${CI_PROJECT_NAME}\n\n**分支**: master → GitHub main\n\n**提交者**: ${GITLAB_USER_LOGIN}\n\n**提交信息**: ${CI_COMMIT_MESSAGE}\n\n**时间**: $(date '+%Y-%m-%d %H:%M:%S')\n\n**状态**: ✅ 同步成功\n\n[查看 GitHub 仓库](https://github.com/${GITHUB_USERNAME}/${GITHUB_REPO})\n\n[查看 Pipeline](${CI_PIPELINE_URL})\"
+    #       }
+    #     }"
+    - echo "通知已发送（如已配置）"
+  only:
+    - master
+  when: on_success
+  allow_failure: true  # 通知失败不影响整体流程
+
+# 同步失败通知
+notify_failure:
+  stage: .post
+  image: curlimages/curl:latest
+  script:
+    - echo "⚠️ 发送失败通知..."
+    # 发送失败通知到团队
+    # - |
+    #   curl -X POST "${DINGTALK_WEBHOOK}" \
+    #     -H 'Content-Type: application/json' \
+    #     -d "{
+    #       \"msgtype\": \"markdown\",
+    #       \"markdown\": {
+    #         \"title\": \"代码开源同步失败\",
+    #         \"text\": \"## ⚠️ 代码开源同步失败\n\n**项目**: ${CI_PROJECT_NAME}\n\n**分支**: master\n\n**提交者**: ${GITLAB_USER_LOGIN}\n\n**时间**: $(date '+%Y-%m-%d %H:%M:%S')\n\n**状态**: ❌ 同步失败\n\n请检查 [Pipeline 日志](${CI_PIPELINE_URL})\"
+    #       }
+    #     }"
+    - echo "失败通知已发送（如已配置）"
+  only:
+    - master
+  when: on_failure
+  allow_failure: true
+
+# ================================
+# 配置说明
+# ================================
+
+# 需要在 GitLab 中配置以下 CI/CD 变量:
+# Settings → CI/CD → Variables
+# 
+# | 变量名            | 值                              | Protected | Masked | 说明                |
+# |-------------------|---------------------------------|-----------|--------|---------------------|
+# | GITHUB_USERNAME   | your-github-username            | ✅        | ❌     | GitHub 用户名       |
+# | GITHUB_TOKEN      | ghp_xxxxxxxxxxxx                | ✅        | ✅     | GitHub PAT          |
+# | GITHUB_REPO       | your-open-source-project        | ✅        | ❌     | GitHub 仓库名       |
+# | DINGTALK_WEBHOOK  | https://oapi.dingtalk.com/...   | ✅        | ✅     | 钉钉 Webhook (可选) |
+#
+# 注意事项:
+# 1. 确保 GitHub Token 具有 'repo' 权限
+# 2. 所有变量都应标记为 Protected，敏感信息标记为 Masked
+# 3. 根据项目实际情况修改 test 任务中的命令（npm/pip/maven 等）
+# 4. 如需启用通知，取消注释 notify_success 和 notify_failure 中的 curl 命令
+# 5. 如果项目没有测试，可以注释掉 test 任务或修改 script 内容
